@@ -1,17 +1,40 @@
+use std::io::{Seek, SeekFrom};
 use std::{
     fs::File,
     io::{BufRead, BufReader, Cursor, Read},
 };
 
+use quick_xml::errors::IllFormedError;
 use quick_xml::events::Event;
+use tokio::join;
 
 #[tokio::main]
 async fn main() {
-    let reader =
-        quick_xml::Reader::from_file("enwiki-20241201-pages-articles-multistream.xml").unwrap();
+    let handle_one = tokio::spawn(async move {
+        let file = File::open("enwiki-20241201-pages-articles-multistream.xml").unwrap();
+        let reader = BufReader::new(file);
+        let reader = quick_xml::Reader::from_reader(reader);
 
-    let mut state_machine = StateMachine::default();
-    state_machine.run(reader);
+        let mut state_machine = StateMachine::default();
+        state_machine.run(reader);
+    });
+
+    let handle_two = tokio::spawn(async move {
+        let file = File::open("enwiki-20241201-pages-articles-multistream.xml").unwrap();
+        let mut reader = BufReader::new(file);
+
+        let middle = reader.get_ref().metadata().unwrap().len() / 2;
+        reader.seek(SeekFrom::Start(middle)).unwrap();
+
+        let reader = quick_xml::Reader::from_reader(reader);
+
+        let mut state_machine = StateMachine::default();
+        state_machine.run(reader);
+    });
+
+    let (one, two) = join!(handle_one, handle_two);
+    one.unwrap();
+    two.unwrap();
 }
 
 #[derive(Debug)]
@@ -70,9 +93,7 @@ impl StateMachine {
                         self.title = (&bytes as &[u8]).to_vec();
                     }
                     State::FoundText => {
-                        //dbg!(String::from_utf8(self.title.clone()).unwrap());
                         let links = self.parse_links(&bytes as &[u8]);
-                        //dbg!(links);
                         self.change_state(State::Idle);
                     }
                     s => panic!("invalid state {s:?}",),
@@ -87,7 +108,10 @@ impl StateMachine {
                     s => panic!("invalid state {s:?}",),
                 },
                 Ok(_) => {}
-                Err(err) => panic!("{}", err),
+                Err(err) => match err {
+                    quick_xml::Error::IllFormed(_) => {}
+                    _ => panic!("{:?}", err),
+                },
             }
 
             buf.clear();
