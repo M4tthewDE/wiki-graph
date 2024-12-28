@@ -1,4 +1,7 @@
-use std::{fs::File, io::BufReader};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Cursor, Read},
+};
 
 use quick_xml::events::Event;
 
@@ -67,8 +70,9 @@ impl StateMachine {
                         self.title = (&bytes as &[u8]).to_vec();
                     }
                     State::FoundText => {
+                        //dbg!(String::from_utf8(self.title.clone()).unwrap());
                         let links = self.parse_links(&bytes as &[u8]);
-                        dbg!(links);
+                        //dbg!(links);
                         self.change_state(State::Idle);
                     }
                     s => panic!("invalid state {s:?}",),
@@ -95,7 +99,30 @@ impl StateMachine {
     }
 
     fn parse_links(&self, text: &[u8]) -> Vec<Link> {
-        vec![]
+        let mut cursor = Cursor::new(text);
+        let mut buf = Vec::new();
+        let mut links = Vec::new();
+
+        loop {
+            cursor.read_until(b'[', &mut buf).unwrap();
+            buf.clear();
+            if cursor.position() as usize == text.len() {
+                break;
+            }
+
+            let mut bracket = vec![0; 1];
+            cursor.read_exact(&mut bracket).unwrap();
+
+            if bracket == vec![b'['] {
+                cursor.read_until(b']', &mut buf).unwrap();
+                let link = Link {
+                    name: String::from_utf8(buf[..buf.len() - 1].to_vec()).unwrap(),
+                };
+                links.push(link);
+            }
+        }
+
+        links
     }
 }
 
