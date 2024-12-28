@@ -4,22 +4,38 @@ use std::{
     io::{BufRead, BufReader, Cursor, Read},
 };
 
-use quick_xml::errors::IllFormedError;
 use quick_xml::events::Event;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{Pool, Postgres, QueryBuilder};
 use tokio::join;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 #[tokio::main]
 async fn main() {
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect("postgres://postgres:postgres@localhost:5432/wiki")
+        .await
+        .unwrap();
+
+    setup_db(&pool).await;
+
+    let p = pool.clone();
     let handle_one = tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
         let file = File::open("enwiki-20241201-pages-articles-multistream.xml").unwrap();
         let reader = BufReader::new(file);
         let reader = quick_xml::Reader::from_reader(reader);
 
         let mut state_machine = StateMachine::default();
-        state_machine.run(reader);
+        let reader_handle = tokio::spawn(writer(p.clone(), rx));
+        state_machine.run(reader, &p, tx).await;
+        reader_handle.await.unwrap();
     });
 
+    let p = pool.clone();
     let handle_two = tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
         let file = File::open("enwiki-20241201-pages-articles-multistream.xml").unwrap();
         let mut reader = BufReader::new(file);
 
@@ -28,8 +44,10 @@ async fn main() {
 
         let reader = quick_xml::Reader::from_reader(reader);
 
+        let reader_handle = tokio::spawn(writer(p.clone(), rx));
         let mut state_machine = StateMachine::default();
-        state_machine.run(reader);
+        state_machine.run(reader, &p, tx).await;
+        reader_handle.await.unwrap();
     });
 
     let (one, two) = join!(handle_one, handle_two);
@@ -56,11 +74,16 @@ impl Default for State {
 #[derive(Default)]
 struct StateMachine {
     state: State,
-    title: Vec<u8>,
+    title: String,
 }
 
 impl StateMachine {
-    fn run(&mut self, mut reader: quick_xml::Reader<BufReader<File>>) {
+    async fn run(
+        &mut self,
+        mut reader: quick_xml::Reader<BufReader<File>>,
+        pool: &Pool<Postgres>,
+        tx: Sender<Article>,
+    ) {
         let mut buf = Vec::new();
 
         loop {
@@ -90,10 +113,16 @@ impl StateMachine {
                 Ok(Event::Text(bytes)) => match &self.state {
                     State::Idle | State::FoundPage | State::FoundTitleEnd => {}
                     State::FoundTitleStart => {
-                        self.title = (&bytes as &[u8]).to_vec();
+                        self.title = String::from_utf8((&bytes as &[u8]).to_vec()).unwrap();
                     }
                     State::FoundText => {
                         let links = self.parse_links(&bytes as &[u8]);
+                        tx.send(Article {
+                            title: self.title.clone(),
+                            links,
+                        })
+                        .await
+                        .unwrap();
                         self.change_state(State::Idle);
                     }
                     s => panic!("invalid state {s:?}",),
@@ -113,7 +142,6 @@ impl StateMachine {
                     _ => panic!("{:?}", err),
                 },
             }
-
             buf.clear();
         }
     }
@@ -122,14 +150,14 @@ impl StateMachine {
         self.state = state;
     }
 
-    fn parse_links(&self, text: &[u8]) -> Vec<Link> {
+    fn parse_links(&self, text: &[u8]) -> Vec<String> {
         let mut cursor = Cursor::new(text);
         let mut buf = Vec::new();
         let mut links = Vec::new();
 
         loop {
             cursor.read_until(b'[', &mut buf).unwrap();
-            buf.clear();
+            buf = vec![];
             if cursor.position() as usize == text.len() {
                 break;
             }
@@ -139,10 +167,7 @@ impl StateMachine {
 
             if bracket == vec![b'['] {
                 cursor.read_until(b']', &mut buf).unwrap();
-                let link = Link {
-                    name: String::from_utf8(buf[..buf.len() - 1].to_vec()).unwrap(),
-                };
-                links.push(link);
+                links.push(String::from_utf8(buf[..buf.len() - 1].to_vec()).unwrap());
             }
         }
 
@@ -151,6 +176,47 @@ impl StateMachine {
 }
 
 #[derive(Debug)]
-struct Link {
-    name: String,
+struct Article {
+    title: String,
+    links: Vec<String>,
+}
+
+async fn setup_db(pool: &Pool<Postgres>) {
+    sqlx::query("DROP TABLE articles")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE articles (
+        id SERIAL PRIMARY KEY,
+        title text
+    )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_articles(pool: &Pool<Postgres>, articles: &[Article]) {
+    let mut query_builder = QueryBuilder::new("INSERT INTO articles (title) ");
+    query_builder.push_values(articles, |mut b, article| {
+        b.push_bind(article.title.clone());
+    });
+    query_builder.push(" ON CONFLICT DO NOTHING");
+
+    let query = query_builder.build();
+    query.execute(pool).await.unwrap();
+}
+
+async fn writer(pool: Pool<Postgres>, mut rx: Receiver<Article>) {
+    let mut buffer = Vec::new();
+    while let Some(article) = rx.recv().await {
+        buffer.push(article);
+
+        if buffer.len() == 1_000 {
+            insert_articles(&pool, &buffer).await;
+            buffer.clear();
+        }
+    }
 }
